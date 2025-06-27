@@ -223,13 +223,13 @@ def validate_instruction(response: str, inst_type: str, kwargs: Dict[str, Any], 
             return (',' not in response, "No error" if ',' not in response else "Commas found in response.")
 
         if inst_type == "length_constraints:number_characters":
-            count = len(response)
+            count = len(response.strip())
             rel, val = kwargs["relation"], kwargs["num_chars"]
             valid = eval(f"{count} {'>=' if rel == 'at least' else '==' if rel == 'equal to' else '<'} {val}")
             return (valid, "No error" if valid else f"Expected {rel} {val} characters, found {count}.")
 
         if inst_type == "length_constraints:number_words":
-            count = len(re.findall(r'\b[a-zA-Z0-9][a-zA-Z0-9_-]*\b', response))
+            count = len(re.compile(r'\b(?=\S*[A-Za-z0-9])\S+\b').findall(response))
             rel, val = kwargs["relation"], kwargs["num_words"]
             valid = eval(f"{count} {'>=' if rel == 'at least' else '==' if rel == 'equal to' else '<'} {val}")
             return (valid, "No error" if valid else f"Expected {rel} {val} words, found {count}.")
