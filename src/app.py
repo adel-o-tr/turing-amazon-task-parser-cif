@@ -352,6 +352,9 @@ def show_nova_batch_multi():
     )
     if uploaded_files:
         from notebook_processing.processor import process_notebook
+        import pandas as pd
+        import io
+        all_rows = []
         for uploaded_file in uploaded_files:
             st.markdown(f"---\n### Results for `{uploaded_file.name}`")
             with st.spinner(f"Processing `{uploaded_file.name}` and running Nova model for each turn..."):
@@ -364,11 +367,9 @@ def show_nova_batch_multi():
                 except Exception as e:
                     st.error(f"Failed to process notebook `{uploaded_file.name}`: {e}")
                     continue
-
-                
                 results = []
                 conversation = []
-                for turn in notebook_data.get("turns", []):
+                for turn_idx, turn in enumerate(notebook_data.get("turns", [])):
                     prompt = turn.get("prompt", "")
                     instructions = turn.get("instructions", {})
                     if not prompt or not instructions:
@@ -385,39 +386,76 @@ def show_nova_batch_multi():
                     except Exception as e:
                         nova_response = f"Nova error: {e}"
                     turn_result = {"prompt": prompt, "instructions": instructions, "nova_response": nova_response, "validation": []}
+                    failed_validations = []
                     # Validate
                     try:
                         if not isinstance(instructions, dict):
-                            turn_result["validation"].append({"error": "Instructions must be a JSON object"})
+                            error_msg = "Instructions must be a JSON object"
+                            turn_result["validation"].append({"error": error_msg})
+                            failed_validations.append({"Instruction ID": "", "Failure Message": error_msg})
                         elif "instruction_change" not in instructions or "instructions" not in instructions:
-                            turn_result["validation"].append({"error": "Instructions must contain 'instruction_change' and 'instructions' fields"})
+                            error_msg = "Instructions must contain 'instruction_change' and 'instructions' fields"
+                            turn_result["validation"].append({"error": error_msg})
+                            failed_validations.append({"Instruction ID": "", "Failure Message": error_msg})
                         elif not isinstance(instructions["instruction_change"], list):
-                            turn_result["validation"].append({"error": "'instruction_change' must be a list"})
+                            error_msg = "'instruction_change' must be a list"
+                            turn_result["validation"].append({"error": error_msg})
+                            failed_validations.append({"Instruction ID": "", "Failure Message": error_msg})
                         elif not isinstance(instructions["instructions"], list):
-                            turn_result["validation"].append({"error": "'instructions' must be a list"})
+                            error_msg = "'instructions' must be a list"
+                            turn_result["validation"].append({"error": error_msg})
+                            failed_validations.append({"Instruction ID": "", "Failure Message": error_msg})
                         else:
                             for instruction in instructions["instructions"]:
                                 if not isinstance(instruction, dict) or "instruction_id" not in instruction:
-                                    turn_result["validation"].append({"error": "Each instruction must be an object with 'instruction_id'"})
+                                    error_msg = "Each instruction must be an object with 'instruction_id'"
+                                    turn_result["validation"].append({"error": error_msg})
+                                    failed_validations.append({"Instruction ID": "", "Failure Message": error_msg})
                                     continue
                                 inst_id = instruction["instruction_id"]
                                 kwargs = {k: v for k, v in instruction.items() if k != "instruction_id"}
                                 valid, message = validate_instruction(nova_response, inst_id, kwargs, instructions)
-                                turn_result["validation"].append({
+                                result_entry = {
                                     "instruction": inst_id,
                                     "status": "Passed" if valid else "Failed",
                                     "message": message
-                                })
+                                }
+                                turn_result["validation"].append(result_entry)
+                                if not valid:
+                                    failed_validations.append({"Instruction ID": inst_id, "Failure Message": message})
                     except Exception as e:
-                        turn_result["validation"].append({"error": f"Validation error: {e}"})
+                        error_msg = f"Validation error: {e}"
+                        turn_result["validation"].append({"error": error_msg})
+                        failed_validations.append({"Instruction ID": "", "Failure Message": error_msg})
                     results.append(turn_result)
                     conversation.append({"prompt": prompt, "nova_response": nova_response})
+                    # Only add row if there are failed validations for this turn
+                    if failed_validations:
+                        all_rows.append({
+                            "Notebook Name": uploaded_file.name,
+                            "Turn": turn_idx + 1,
+                            "Prompt": prompt,
+                            "Nova Response": nova_response,
+                            "Failed Validations": json.dumps(failed_validations, ensure_ascii=False)
+                        })
                 st.success(f"Batch Nova validation complete for `{uploaded_file.name}`!")
                 for i, res in enumerate(results):
                     st.markdown(f"#### Turn {i+1}")
                     st.markdown(f"**Prompt:** {res['prompt']}")
                     st.markdown(f"**Nova Response:** {res['nova_response']}")
                     st.json(res["validation"])
+        # Export to XLSX button
+        if all_rows:
+            df = pd.DataFrame(all_rows)
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+                df.to_excel(writer, index=False, sheet_name="Failed Validations")
+            st.download_button(
+                label="Export Failed Validations to XLSX",
+                data=output.getvalue(),
+                file_name="nova_batch_failed_validations.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 
 if __name__ == "__main__":
     main() 
