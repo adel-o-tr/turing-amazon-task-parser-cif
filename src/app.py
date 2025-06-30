@@ -14,6 +14,7 @@ st.set_page_config(
     layout="wide"
 )
 
+
 def call_nova_api(user_content, system_content="You are a chatbot", temperature=0.7, seed=42, top_p=1, top_k=40, max_tokens=1000):
     url = "https://kong.turing.com/api/llm-gateway"
     headers = {
@@ -49,10 +50,11 @@ def main():
     st.title("Turing Amazon Task Parser VIF")
     st.markdown("Process and validate Jupyter notebooks containing Turing Amazon task data.")
     # Tabs
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "Validation (Single Turn)",
         "Validation (Batch/Notebook)",
         "Nova (Conversation)",
+        "Nova (Batch/Notebook)",
     ])
     with tab1:
         show_single_cell_validation()
@@ -62,6 +64,10 @@ def main():
         st.subheader("Nova Model: Conversation Test & Validation")
         st.markdown("Test a prompt against the Nova model and validate the result.")
         show_nova_single_turn()
+    with tab4:
+        st.subheader("Nova Model: Batch Notebook Validation")
+        st.markdown("Upload one or more Jupyter notebooks. Each will be run as a sequential conversation against Nova, and each turn will be validated.")
+        show_nova_batch_multi()
 
 def show_batch_processing():
     st.header("Notebook Processing and Validation")
@@ -337,55 +343,81 @@ def show_nova_single_turn():
         })
         st.rerun()
 
-def show_nova_batch():
-    uploaded_file = st.file_uploader("Upload Jupyter notebook", type=["ipynb"], key="nova_batch")
-    if uploaded_file:
-        with st.spinner("Processing notebook and calling Nova model for each turn..."):
-            from notebook_processing.processor import process_notebook
-            notebook_data = process_notebook(uploaded_file)
-            results = []
-            for turn in notebook_data["turns"]:
-                prompt = turn.get("prompt", "")
-                instructions = turn.get("instructions", {})
-                if not prompt or not instructions:
+def show_nova_batch_multi():
+    uploaded_files = st.file_uploader(
+        "Upload Jupyter notebooks",
+        type=["ipynb"],
+        accept_multiple_files=True,
+        key="nova_batch_multi"
+    )
+    if uploaded_files:
+        from notebook_processing.processor import process_notebook
+        for uploaded_file in uploaded_files:
+            st.markdown(f"---\n### Results for `{uploaded_file.name}`")
+            with st.spinner(f"Processing `{uploaded_file.name}` and running Nova model for each turn..."):
+                try:
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        file_path = os.path.join(temp_dir, uploaded_file.name)
+                        with open(file_path, "wb") as f:
+                            f.write(uploaded_file.getbuffer())
+                        notebook_data = process_notebook(file_path)
+                except Exception as e:
+                    st.error(f"Failed to process notebook `{uploaded_file.name}`: {e}")
                     continue
-                try:
-                    nova_response = call_nova_api(prompt)
-                except Exception as e:
-                    nova_response = f"Nova error: {e}"
-                turn_result = {"prompt": prompt, "instructions": instructions, "nova_response": nova_response, "validation": []}
-                # Validate
-                try:
-                    if not isinstance(instructions, dict):
-                        turn_result["validation"].append({"error": "Instructions must be a JSON object"})
-                    elif "metadata" not in instructions or "instructions" not in instructions:
-                        turn_result["validation"].append({"error": "Instructions must contain 'metadata' and 'instructions' fields"})
-                    elif not isinstance(instructions["metadata"], list):
-                        turn_result["validation"].append({"error": "'metadata' must be a list"})
-                    elif not isinstance(instructions["instructions"], list):
-                        turn_result["validation"].append({"error": "'instructions' must be a list"})
-                    else:
-                        for instruction in instructions["instructions"]:
-                            if not isinstance(instruction, dict) or "instruction_id" not in instruction:
-                                turn_result["validation"].append({"error": "Each instruction must be an object with 'instruction_id'"})
-                                continue
-                            inst_id = instruction["instruction_id"]
-                            kwargs = {k: v for k, v in instruction.items() if k != "instruction_id"}
-                            valid, message = validate_instruction(nova_response, inst_id, kwargs, instructions)
-                            turn_result["validation"].append({
-                                "instruction": inst_id,
-                                "status": "Passed" if valid else "Failed",
-                                "message": message
-                            })
-                except Exception as e:
-                    turn_result["validation"].append({"error": f"Validation error: {e}"})
-                results.append(turn_result)
-            st.success("Batch Nova validation complete!")
-            for i, res in enumerate(results):
-                st.markdown(f"#### Turn {i+1}")
-                st.markdown(f"**Prompt:** {res['prompt']}")
-                st.markdown(f"**Nova Response:** {res['nova_response']}")
-                st.json(res["validation"])
+
+                
+                results = []
+                conversation = []
+                for turn in notebook_data.get("turns", []):
+                    prompt = turn.get("prompt", "")
+                    instructions = turn.get("instructions", {})
+                    if not prompt or not instructions:
+                        continue
+                    # Build conversation context
+                    messages = []
+                    for prev in conversation:
+                        messages.append({"role": "user", "content": prev["prompt"]})
+                        messages.append({"role": "assistant", "content": prev["nova_response"]})
+                    messages.append({"role": "user", "content": prompt})
+                    context_prompt = "\n".join([m["content"] for m in messages])
+                    try:
+                        nova_response = call_nova_api(context_prompt)
+                    except Exception as e:
+                        nova_response = f"Nova error: {e}"
+                    turn_result = {"prompt": prompt, "instructions": instructions, "nova_response": nova_response, "validation": []}
+                    # Validate
+                    try:
+                        if not isinstance(instructions, dict):
+                            turn_result["validation"].append({"error": "Instructions must be a JSON object"})
+                        elif "instruction_change" not in instructions or "instructions" not in instructions:
+                            turn_result["validation"].append({"error": "Instructions must contain 'instruction_change' and 'instructions' fields"})
+                        elif not isinstance(instructions["instruction_change"], list):
+                            turn_result["validation"].append({"error": "'instruction_change' must be a list"})
+                        elif not isinstance(instructions["instructions"], list):
+                            turn_result["validation"].append({"error": "'instructions' must be a list"})
+                        else:
+                            for instruction in instructions["instructions"]:
+                                if not isinstance(instruction, dict) or "instruction_id" not in instruction:
+                                    turn_result["validation"].append({"error": "Each instruction must be an object with 'instruction_id'"})
+                                    continue
+                                inst_id = instruction["instruction_id"]
+                                kwargs = {k: v for k, v in instruction.items() if k != "instruction_id"}
+                                valid, message = validate_instruction(nova_response, inst_id, kwargs, instructions)
+                                turn_result["validation"].append({
+                                    "instruction": inst_id,
+                                    "status": "Passed" if valid else "Failed",
+                                    "message": message
+                                })
+                    except Exception as e:
+                        turn_result["validation"].append({"error": f"Validation error: {e}"})
+                    results.append(turn_result)
+                    conversation.append({"prompt": prompt, "nova_response": nova_response})
+                st.success(f"Batch Nova validation complete for `{uploaded_file.name}`!")
+                for i, res in enumerate(results):
+                    st.markdown(f"#### Turn {i+1}")
+                    st.markdown(f"**Prompt:** {res['prompt']}")
+                    st.markdown(f"**Nova Response:** {res['nova_response']}")
+                    st.json(res["validation"])
 
 if __name__ == "__main__":
     main() 
